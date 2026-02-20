@@ -1,0 +1,20 @@
+import serial
+import time
+
+ser = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
+
+time.sleep(2)
+
+# Send set values
+set_temp = 25
+set_hum = 80
+
+cmd = f"SET:T={set_temp},H={set_hum}\n"
+ser.write(cmd.encode())
+
+while True:
+    if ser.in_waiting:
+        data = ser.readline().decode().strip()
+        print("Received:", data)
+
+    time.sleep(1)
