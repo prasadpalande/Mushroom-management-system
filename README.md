@@ -1,6 +1,6 @@
 # Mushroom-management-system
 Mushroom cultivation requires controlled environmental conditions such as temperature, humidity, and airflow. Traditional farming depends on manual monitoring, which leads to inconsistent growth and lower yield.
-# 🚀 STM32 Motor & Irrigation Control System
+# 🚀 mcu and mpu Motor & fog Control System
 
 ## 📌 Overview
 This project is based on STM32 microcontroller for controlling:
