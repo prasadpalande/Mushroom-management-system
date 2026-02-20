@@ -1,0 +1,66 @@
+#include "main.h"
+#include <string.h>
+#include <stdio.h>
+
+UART_HandleTypeDef huart1;
+
+float temp = 0;
+float hum = 0;
+
+float set_temp = 25;
+float set_hum = 80;
+
+char rx_data[50];
+char tx_data[50];
+
+// Example GPIO pins
+#define FAN_PIN GPIO_PIN_1
+#define PUMP_PIN GPIO_PIN_2
+#define RELAY_PORT GPIOA
+
+void control_system()
+{
+    if(temp > set_temp)
+        HAL_GPIO_WritePin(RELAY_PORT, FAN_PIN, GPIO_PIN_SET);
+    else
+        HAL_GPIO_WritePin(RELAY_PORT, FAN_PIN, GPIO_PIN_RESET);
+
+    if(hum < set_hum)
+        HAL_GPIO_WritePin(RELAY_PORT, PUMP_PIN, GPIO_PIN_SET);
+    else
+        HAL_GPIO_WritePin(RELAY_PORT, PUMP_PIN, GPIO_PIN_RESET);
+}
+
+void parse_command(char *data)
+{
+    // Example: SET:T=25,H=80
+    sscanf(data, "SET:T=%f,H=%f", &set_temp, &set_hum);
+}
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_USART1_UART_Init();
+
+    while (1)
+    {
+        // ---- READ SENSOR (Replace with DHT code) ----
+        temp = 24 + (rand() % 3);
+        hum  = 75 + (rand() % 5);
+
+        // ---- CONTROL ----
+        control_system();
+
+        // ---- RECEIVE FROM PI ----
+        HAL_UART_Receive(&huart1, (uint8_t*)rx_data, sizeof(rx_data), 100);
+        parse_command(rx_data);
+
+        // ---- SEND DATA TO PI ----
+        sprintf(tx_data, "DATA:T=%.1f,H=%.1f\r\n", temp, hum);
+        HAL_UART_Transmit(&huart1, (uint8_t*)tx_data, strlen(tx_data), 100);
+
+        HAL_Delay(2000);
+    }
+}
