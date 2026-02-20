@@ -1,0 +1,179 @@
+STM32 GREENHOUSE CONTROLLER
+FIRMWARE DESIGN DOCUMENT
+Version 1.0  ·  Embedded C (HAL)  ·  STM32F103
+
+1.  SYSTEM OVERVIEW
+
+This firmware runs on an STM32F103 microcontroller and forms the real-time control core of a smart greenhouse system. It reads temperature and humidity via a DHT sensor, drives relay-controlled actuators (fan, pump, heater), and communicates bidirectionally with a Raspberry Pi host over UART.
+
+📌  The Pi acts as the HMI and data logger. The STM32 is the safety-critical real-time controller. Even if UART comms are lost, the STM32 continues to regulate the environment using last-known setpoints.
+
+1.1  Key Responsibilities
+▸	Periodic sensor acquisition  — DHT11/22 every 2 s with CRC validation and retry
+▸	Relay hysteresis control  — Prevents chatter at threshold boundaries
+▸	UART framing  — ASCII protocol with fixed prefixes (DATA / SET / ACK / ERR)
+▸	Fault handling  — Safe relay-off state + ERR frame on sensor failure
+▸	Watchdog  — IWDG resets the MCU if the main loop stalls > 4 s
+
+2.  FIRMWARE ARCHITECTURE
+
+2.1  Layer Model
+
+Layer	File(s)	Responsibility
+Application Layer	main.c	Orchestrates sensor read → control → comms loop
+Control Layer	control.c / .h	Hysteresis logic, relay state machine
+Sensor Driver	dht.c / .h	DHT11/22 1-wire timing, CRC check
+UART Comms	uart_comms.c / .h	Rx/Tx framing, ring buffer, ISR callback
+HAL / BSP	STM32 HAL + MX init	Clock, GPIO, USART1 peripheral init
+
+2.2  File Structure
+Core/
+  Src/
+    main.c          ← top-level loop + init
+    control.c       ← relay hysteresis state machine
+    dht.c           ← DHT sensor 1-wire driver
+    uart_comms.c    ← UART framing, ring buffer, ISR
+  Inc/
+    control.h
+    dht.h
+    uart_comms.h
+  Startup / HAL / MX generated files
+
+📌  MX-generated files (main.h, stm32f1xx_hal_conf.h) should never be manually edited. All application logic lives in the Src/ modules above.
+
+3.  MAIN LOOP FLOW
+
+The superloop runs at a fixed 2-second cadence enforced by HAL_Delay(). Each iteration follows a strict read → control → comms order to ensure actuator decisions are always based on fresh sensor data.
+
+3.1  Pseudocode
+HAL_Init() → SystemClock_Config() → MX_GPIO_Init() → MX_USART1_UART_Init()
+UART_Init()   // start Rx interrupt + ring buffer
+Control_Init() // set relay pins low, load defaults
+IWDG_Start(4000ms)
+
+while(1) {
+    status = DHT_Read(&sensor)
+    if (status == DHT_OK)
+        Control_Update(sensor.temp, sensor.hum)
+    else
+        Control_Fault()              // relays OFF, send ERR
+
+    if (UART_ParseCommand(rx_buf))   // non-blocking ring-buffer read
+        Control_SetThresholds(t, h)  // update setpoints
+
+    UART_SendData(sensor.temp, sensor.hum)
+    HAL_IWDG_Refresh(&hiwdg)
+    HAL_Delay(2000)
+}
+
+4.  CONTROL STATE MACHINE
+
+The control module implements a hysteresis-based state machine to prevent relay chatter when sensor values hover near setpoints. Each relay is independently managed with configurable hysteresis bands.
+
+State	Action	Condition	Next State
+IDLE	Awaiting first sensor read	Sensor read complete	READING
+READING	Read DHT, validate CRC	Valid data	CONTROLLING
+READING	Read DHT, validate CRC	CRC fail (≤ 3 retries)	READING
+READING	Read DHT, validate CRC	3 consecutive failures	FAULT
+CONTROLLING	Apply hysteresis, drive relays	Control applied	TRANSMITTING
+TRANSMITTING	Send DATA frame to Pi over UART	Tx complete	RECEIVING
+RECEIVING	Check for incoming SET command	CMD received or timeout	IDLE
+FAULT	All relays OFF, send ERR frame	Watchdog reset	IDLE
+
+4.1  Hysteresis Values (Default)
+Parameter	Default	Macro Name
+Temp ON threshold	> set_temp	—
+Temp hysteresis	± 0.5 °C	TEMP_HYST
+Hum ON threshold	< set_hum	—
+Hum hysteresis	± 2.0 %RH	HUM_HYST
+
+5.  UART COMMUNICATION PROTOCOL
+
+UART1 is configured at 9600 baud, 8-N-1. All frames are ASCII-printable, terminated with \r\n, and prefixed with a 3-4 character type identifier. Maximum frame length is 32 bytes.
+
+Direction	Type	Frame Example	Purpose
+Pi → STM32	SET	SET:T=25.0,H=80.0\r\n	Set target temperature & humidity
+Pi → STM32	PING	PING\r\n	Heartbeat / connection check
+STM32 → Pi	DATA	DATA:T=24.5,H=78.2\r\n	Live sensor reading
+STM32 → Pi	ACK	ACK:SET\r\n	Acknowledge SET command
+STM32 → Pi	ERR	ERR:DHT_FAIL\r\n	Sensor or system fault
+STM32 → Pi	PONG	PONG\r\n	Reply to PING
+
+5.1  Reception Architecture
+Reception is interrupt-driven. HAL_UART_Receive_IT() is called after each byte. The ISR appends bytes to a 128-byte ring buffer. The main loop calls UART_ParseCommand() which drains the ring buffer looking for a complete \r\n-terminated frame.
+
+📌  This design means the main loop is never blocked waiting for UART data. A 100 ms timeout on reception is not needed and has been removed from the improved design.
+
+6.  GPIO & PIN ASSIGNMENT
+
+Pin	Dir	Label	Description
+PA1	Output	FAN_PIN	Relay 1 — Cooling fan
+PA2	Output	PUMP_PIN	Relay 2 — Humidifier pump
+PA3	Output	HEAT_PIN	Relay 3 — Heater (optional)
+PB0	Input	DHT_DATA	DHT11/22 data line (open-drain + pull-up)
+PA9	AF	USART1_TX	UART transmit to Raspberry Pi
+PA10	AF	USART1_RX	UART receive from Raspberry Pi
+PC13	Output	STATUS_LED	Heartbeat / fault indicator LED
+
+📌  DHT data pin requires a 4.7 kΩ pull-up resistor to 3.3 V. Relay pins drive optocoupler inputs — ensure current-limiting resistors are fitted on the PCB.
+
+7.  MODULE API REFERENCE
+
+Module	Function Signature	Description
+control.h	void Control_Init(void)	Initialise relay GPIOs, set default thresholds
+control.h	void Control_Update(float t, float h)	Run hysteresis logic, drive relay pins
+control.h	void Control_SetThresholds(float t, float h)	Update setpoints from parsed UART command
+control.h	Control_State_t Control_GetState(void)	Return current FAN / PUMP / HEAT bitmask
+dht.h	DHT_Status_t DHT_Read(DHT_Data_t *out)	Read sensor; fills temp & hum; returns OK/ERR
+dht.h	const char* DHT_StatusStr(DHT_Status_t s)	Human-readable status string for logging
+uart_comms.h	void UART_Init(void)	Set up ring buffer, start Rx interrupt
+uart_comms.h	void UART_SendData(float t, float h)	Format & transmit DATA frame
+uart_comms.h	bool UART_ParseCommand(char *buf)	Parse rx buffer; returns true if SET received
+
+8.  ERROR HANDLING & SAFETY
+
+8.1  DHT Sensor Failures
+▸	Up to 3 consecutive read retries before declaring FAULT state
+▸	On FAULT: all relays are forced OFF (safe, cold-dry default)
+▸	ERR:DHT_FAIL frame is sent to Pi so the operator is alerted
+▸	IWDG watchdog resets MCU after 4 s if loop stalls in FAULT
+
+8.2  UART Failures
+▸	Receive timeout is non-blocking — missed commands do not stall the loop
+▸	rx_data buffer is cleared (memset) before each receive attempt
+▸	sscanf return value validated — partial frames are silently discarded
+▸	Setpoint sanity bounds enforced: T ∈ (0, 60 °C), H ∈ (0, 100 %)
+
+8.3  Relay Safety Rules
+📌  Relays must NEVER be driven simultaneously if the load circuit cannot support concurrent operation. Add a mutual-exclusion check in Control_Update() if fan + heater share the same power rail.
+
+9.  CONFIGURATION & BUILD
+
+9.1  Compile-Time Defines  (control.h)
+#define TEMP_HYST          0.5f    // °C
+#define HUM_HYST           2.0f    // %RH
+#define DHT_MAX_RETRIES    3
+#define UART_RX_BUF_SIZE   128
+#define UART_TX_BUF_SIZE   64
+#define LOOP_PERIOD_MS     2000
+#define IWDG_TIMEOUT_MS    4000
+
+9.2  Default Setpoints  (adjustable via UART SET command)
+#define DEFAULT_SET_TEMP   25.0f   // °C
+#define DEFAULT_SET_HUM    80.0f   // %RH
+
+9.3  Toolchain
+▸	STM32CubeIDE 1.14+  or  arm-none-eabi-gcc 12+
+▸	HAL library: STM32CubeF1 v1.8.5
+▸	Flash via ST-Link V2 or DFU over USB
+
+10.  FUTURE IMPROVEMENTS
+
+▸	DMA-based UART  — Replace interrupt Rx/Tx with DMA for zero CPU overhead
+▸	PID control  — Replace on/off relay logic with PWM + PID for smoother regulation
+▸	EEPROM/Flash storage  — Persist setpoints across power cycles using emulated EEPROM
+▸	FreeRTOS  — Separate sensor, control, and comms into independent tasks
+▸	Multiple sensors  — Support SHT31 over I2C as a higher-accuracy fallback
+▸	OTA update  — Bootloader with UART or CAN-based firmware update capability
+
+Document generated from code review — update version number and author field before distributing.
